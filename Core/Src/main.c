@@ -45,6 +45,13 @@
 #define BMP280_PRESS_MSB 0xF7
 #define BMP280_TEMP_MSB  0xFA
 
+#define ICM20948_ADDR 0x69 << 1 // Default I2C address for IMU
+#define ICM_WHO_AM_I  0x00      // WHO_AM_I register
+#define ICM_PWR_MGMT_1 0x06     // Power management register
+#define ICM_ACCEL_XOUT_H 0x2D   // First accel register (high byte)
+#define ICM_GYRO_XOUT_H  0x33   // First gyro register (high byte)
+#define ICM_MAG_XOUT_L   0x11   // Magnetometer register (external)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -76,6 +83,11 @@ int16_t  dig_P7;
 int16_t  dig_P8;
 int16_t  dig_P9;
 
+// IMU raw data
+int16_t accel_x, accel_y, accel_z;
+int16_t gyro_x, gyro_y, gyro_z;
+int16_t mag_x, mag_y, mag_z;
+
 // t_fine variable used in compensation
 int32_t t_fine;
 
@@ -90,7 +102,6 @@ static void MX_I2C1_Init(void);
 
 /* USER CODE BEGIN PFP */
 
-// uint8_t BMP280_ReadID(I2C_HandleTypeDef *hi2c);
 HAL_StatusTypeDef BMP280_ReadCalibration(I2C_HandleTypeDef *hi2c);
 void BMP280_Init(I2C_HandleTypeDef *hi2c);
 int32_t BMP280_ReadRawTemperature(I2C_HandleTypeDef *hi2c);
@@ -103,13 +114,6 @@ float BMP280_CalcAltitude(float pressure);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-uint8_t BMP280_ReadID(I2C_HandleTypeDef *hi2c)
-{
-	uint8_t id = 0;
-	HAL_I2C_Mem_Read(hi2c, BMP280_ADDR, 0xD0, I2C_MEMADD_SIZE_8BIT, &id, 1, 100);
-	return id;
-}
 
 // Read calibration data from BMP280
 HAL_StatusTypeDef BMP280_ReadCalibration(I2C_HandleTypeDef *hi2c)
@@ -199,6 +203,49 @@ float BMP280_CalcAltitudeRelative(float pressure, float p0)
     return 44330.0f * (1.0f - powf(pressure / p0, 0.1903f));
 }
 
+/* Simple HAL I2C write */
+HAL_StatusTypeDef IMU_WriteReg(uint8_t reg, uint8_t val)
+{
+    return HAL_I2C_Mem_Write(&hi2c1, ICM20948_ADDR, reg, I2C_MEMADD_SIZE_8BIT, &val, 1, 100);
+}
+
+/* Simple HAL I2C read */
+HAL_StatusTypeDef IMU_ReadReg(uint8_t reg, uint8_t *data, uint16_t len)
+{
+    return HAL_I2C_Mem_Read(&hi2c1, ICM20948_ADDR, reg, I2C_MEMADD_SIZE_8BIT, data, len, 100);
+}
+
+/* Initialize IMU */
+HAL_StatusTypeDef IMU_Init(void)
+{
+    uint8_t whoami;
+    IMU_ReadReg(ICM_WHO_AM_I, &whoami, 1);
+    if(whoami != 0xEA) // Expected WHO_AM_I for ICM-20948
+        return HAL_ERROR;
+
+    // Wake up IMU (clear sleep)
+    IMU_WriteReg(ICM_PWR_MGMT_1, 0x01); // Auto selects best clock source
+    HAL_Delay(10);
+    return HAL_OK;
+}
+
+/* Read accelerometer and gyroscope */
+HAL_StatusTypeDef IMU_ReadAccelGyro(void)
+{
+    uint8_t buf[12];
+    if(IMU_ReadReg(ICM_ACCEL_XOUT_H, buf, 12) != HAL_OK) return HAL_ERROR;
+
+    accel_x = (int16_t)((buf[0] << 8) | buf[1]);
+    accel_y = (int16_t)((buf[2] << 8) | buf[3]);
+    accel_z = (int16_t)((buf[4] << 8) | buf[5]);
+
+    gyro_x = (int16_t)((buf[6] << 8) | buf[7]);
+    gyro_y = (int16_t)((buf[8] << 8) | buf[9]);
+    gyro_z = (int16_t)((buf[10] << 8) | buf[11]);
+
+    return HAL_OK;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -262,36 +309,66 @@ int main(void)
 
   ground_pressure = p_sum / 10.0f;
 
+  // IMU init
+  if(IMU_Init() != HAL_OK)
+  {
+      char error_msg[] = "IMU init failed!\r\n";
+      HAL_UART_Transmit(&huart2, (uint8_t*)error_msg, strlen(error_msg), HAL_MAX_DELAY);
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // Read raw data
-	  int32_t raw_temp = BMP280_ReadRawTemperature(&hi2c1);
-	  int32_t raw_press = BMP280_ReadRawPressure(&hi2c1);
+      // Read raw BMP280 data
+      int32_t raw_temp = BMP280_ReadRawTemperature(&hi2c1);
+      int32_t raw_press = BMP280_ReadRawPressure(&hi2c1);
 
-	  // Convert to real values
-	  float temp = BMP280_CompensateTemperature(raw_temp);
-	  float press = BMP280_CompensatePressure(raw_press);
-	  float alt = BMP280_CalcAltitudeRelative(press, ground_pressure);
+      // Convert to real values
+      float temp = BMP280_CompensateTemperature(raw_temp);
+      float press = BMP280_CompensatePressure(raw_press);
+      float alt = BMP280_CalcAltitudeRelative(press, ground_pressure);
 
-	  // Print to Serial Monitor
-	  sprintf(msg, "Temp: %d.%02d C, Pressure: %d.%02d hPa, Alt: %d.%02d m\r\n",
-	          (int)temp, (int)(temp*100) % 100,
-	          (int)press, (int)(press*100) % 100,
-	          (int)alt, abs((int)(alt*100) % 100));
-	  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+      // --- IMU readings ---
+      if(IMU_ReadAccelGyro() == HAL_OK)
+      {
+          // Convert raw accel to g (±2g default)
+          float ax = accel_x / 16384.0f;
+          float ay = accel_y / 16384.0f;
+          float az = accel_z / 16384.0f;
 
-	  HAL_Delay(1000); // 1-second delay
+          // Convert raw gyro to dps (±250 dps default)
+          float gx = gyro_x / 131.0f;
+          float gy = gyro_y / 131.0f;
+          float gz = gyro_z / 131.0f;
 
-	  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	  HAL_Delay(500); // blink every 0.5 seconds
+          sprintf(msg,
+              "Temp: %.2f C, Press: %.2f hPa, Alt: %.2f m | "
+              "Ax: %.2f g, Ay: %.2f g, Az: %.2f g | "
+              "Gx: %.2f dps, Gy: %.2f dps, Gz: %.2f dps\r\n",
+              temp, press, alt,
+              ax, ay, az,
+              gx, gy, gz
+          );
+      }
+      else
+      {
+          sprintf(msg,
+              "Temp: %.2f C, Press: %.2f hPa, Alt: %.2f m | IMU Read Error\r\n",
+              temp, press, alt
+          );
+      }
 
-    /* USER CODE END WHILE */
+      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    /* USER CODE BEGIN 3 */
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      HAL_Delay(500); // blink every 0.5 seconds
+
+      /* USER CODE END WHILE */
+
+      /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
